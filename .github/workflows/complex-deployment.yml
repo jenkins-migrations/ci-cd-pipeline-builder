@@ -337,8 +337,8 @@ jobs:
     if: >-
       ${{ always()
       && needs.health-check.result == 'success'
-      && needs.integration-tests.result != 'failure'
-      && needs.production-approval.result != 'failure' }}
+      && (needs.integration-tests.result == 'success' || needs.integration-tests.result == 'skipped')
+      && (needs.production-approval.result == 'success' || needs.production-approval.result == 'skipped') }}
     strategy:
       fail-fast: false
       matrix:
