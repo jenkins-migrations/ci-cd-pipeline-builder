@@ -1,0 +1,259 @@
+<![CDATA[
+// Source: Custom comprehensive example with proper licensing
+// Test case: Complex multi-stage deployment with rollback capability
+pipeline {
+    agent any
+    
+    environment {
+        APP_NAME = 'microservice-app'
+        DOCKER_REGISTRY = 'registry.example.com'
+        HELM_CHART = 'microservice-chart'
+        SLACK_CHANNEL = '#deployments'
+    }
+    
+    parameters {
+        choice(
+            name: 'DEPLOYMENT_TARGET',
+            choices: ['dev', 'staging', 'production'],
+            description: 'Target environment for deployment'
+        )
+        booleanParam(
+            name: 'ROLLBACK_ON_FAILURE',
+            defaultValue: true,
+            description: 'Automatically rollback on deployment failure'
+        )
+        string(
+            name: 'CUSTOM_TAG',
+            defaultValue: '',
+            description: 'Custom Docker tag (leave empty for auto-generated)'
+        )
+    }
+    
+    stages {
+        stage('Preparation') {
+            steps {
+                script {
+                    // Set dynamic environment variables
+                    env.GIT_COMMIT_SHORT = sh(returnStdout: true, script: 'git rev-parse --short HEAD').trim()
+                    env.BUILD_TAG = params.CUSTOM_TAG ?: "${env.GIT_COMMIT_SHORT}-${env.BUILD_NUMBER}"
+                    env.IMAGE_TAG = "${env.DOCKER_REGISTRY}/${env.APP_NAME}:${env.BUILD_TAG}"
+                    
+                    currentBuild.description = "Deploying ${env.BUILD_TAG} to ${params.DEPLOYMENT_TARGET}"
+                }
+                
+                echo "🚀 Starting deployment pipeline"
+                echo "📦 Image tag: ${env.IMAGE_TAG}"
+                echo "🎯 Target: ${params.DEPLOYMENT_TARGET}"
+            }
+        }
+        
+        stage('Build & Test') {
+            parallel {
+                stage('Unit Tests') {
+                    steps {
+                        sh 'mvn clean test'
+                        publishTestResults testResultsPattern: '**/surefire-reports/*.xml'
+                        publishCoverage adapters: [jacocoAdapter('**/target/site/jacoco/jacoco.xml')]
+                    }
+                }
+                
+                stage('Security Scan') {
+                    steps {
+                        sh 'dependency-check --project "${APP_NAME}" --scan . --format XML'
+                        publishHTML([
+                            allowMissing: false,
+                            alwaysLinkToLastBuild: true,
+                            keepAll: true,
+                            reportDir: 'target',
+                            reportFiles: 'dependency-check-report.html',
+                            reportName: 'Security Scan Report'
+                        ])
+                    }
+                }
+                
+                stage('Code Quality') {
+                    steps {
+                        withSonarQubeEnv('SonarQube') {
+                            sh 'mvn sonar:sonar -Dsonar.projectKey=${APP_NAME}'
+                        }
+                        
+                        timeout(time: 10, unit: 'MINUTES') {
+                            script {
+                                def qg = waitForQualityGate()
+                                if (qg.status != 'OK') {
+                                    error "❌ Quality gate failed: ${qg.status}"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Build Docker Image') {
+            steps {
+                script {
+                    sh 'mvn package -DskipTests'
+                    
+                    def image = docker.build("${env.IMAGE_TAG}")
+                    
+                    docker.withRegistry("https://${env.DOCKER_REGISTRY}", 'docker-registry-credentials') {
+                        image.push()
+                        image.push('latest')
+                    }
+                    
+                    // Security scan of the image
+                    sh "trivy image --exit-code 0 --severity HIGH,CRITICAL ${env.IMAGE_TAG}"
+                }
+            }
+        }
+        
+        stage('Deploy') {
+            steps {
+                script {
+                    // Get current deployment for potential rollback
+                    env.PREVIOUS_RELEASE = sh(
+                        returnStdout: true,
+                        script: "helm list -n ${params.DEPLOYMENT_TARGET} -o json | jq -r '.[] | select(.name==\"${env.APP_NAME}\") | .app_version' || echo 'none'"
+                    ).trim()
+                    
+                    echo "📋 Previous release: ${env.PREVIOUS_RELEASE}"
+                    
+                    try {
+                        // Deploy using Helm
+                        sh """
+                            helm upgrade --install ${env.APP_NAME} ${env.HELM_CHART} \
+                                --namespace ${params.DEPLOYMENT_TARGET} \
+                                --set image.repository=${env.DOCKER_REGISTRY}/${env.APP_NAME} \
+                                --set image.tag=${env.BUILD_TAG} \
+                                --set environment=${params.DEPLOYMENT_TARGET} \
+                                --wait --timeout=10m
+                        """
+                        
+                        // Wait for deployment to be ready
+                        sh """
+                            kubectl wait --for=condition=available --timeout=300s \
+                                deployment/${env.APP_NAME} -n ${params.DEPLOYMENT_TARGET}
+                        """
+                        
+                    } catch (Exception e) {
+                        if (params.ROLLBACK_ON_FAILURE && env.PREVIOUS_RELEASE != 'none') {
+                            echo "🔄 Deployment failed, initiating rollback to ${env.PREVIOUS_RELEASE}"
+                            sh """
+                                helm rollback ${env.APP_NAME} 0 -n ${params.DEPLOYMENT_TARGET}
+                                kubectl wait --for=condition=available --timeout=300s \
+                                    deployment/${env.APP_NAME} -n ${params.DEPLOYMENT_TARGET}
+                            """
+                            error "❌ Deployment failed and rolled back to previous version"
+                        } else {
+                            error "❌ Deployment failed: ${e.message}"
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Health Check') {
+            steps {
+                script {
+                    def healthEndpoint = "https://${params.DEPLOYMENT_TARGET}.example.com/health"
+                    
+                    retry(5) {
+                        sleep 10
+                        sh "curl -f ${healthEndpoint} || exit 1"
+                    }
+                    
+                    echo "✅ Health check passed"
+                }
+            }
+        }
+        
+        stage('Integration Tests') {
+            when {
+                not { 
+                    expression { params.DEPLOYMENT_TARGET == 'production' }
+                }
+            }
+            steps {
+                sh """
+                    mvn failsafe:integration-test \
+                        -Dtest.endpoint=https://${params.DEPLOYMENT_TARGET}.example.com \
+                        -Dtest.environment=${params.DEPLOYMENT_TARGET}
+                """
+                publishTestResults testResultsPattern: '**/failsafe-reports/*.xml'
+            }
+        }
+        
+        stage('Production Approval') {
+            when {
+                expression { params.DEPLOYMENT_TARGET == 'production' }
+            }
+            steps {
+                timeout(time: 30, unit: 'MINUTES') {
+                    input message: '🚀 Deploy to Production?',
+                          ok: 'Deploy to Production',
+                          submitterParameter: 'APPROVER'
+                }
+                echo "✅ Production deployment approved by: ${env.APPROVER}"
+            }
+        }
+        
+        stage('Smoke Tests') {
+            steps {
+                parallel(
+                    "API Tests": {
+                        sh "newman run postman-collection.json --environment ${params.DEPLOYMENT_TARGET}.json"
+                    },
+                    "UI Tests": {
+                        sh "cypress run --config baseUrl=https://${params.DEPLOYMENT_TARGET}.example.com"
+                    },
+                    "Performance Tests": {
+                        sh "artillery run performance-test.yml --target https://${params.DEPLOYMENT_TARGET}.example.com"
+                    }
+                )
+            }
+        }
+    }
+    
+    post {
+        success {
+            script {
+                slackSend(
+                    channel: env.SLACK_CHANNEL,
+                    color: 'good',
+                    message: """
+                        ✅ *Deployment Successful*
+                        📦 *Application:* ${env.APP_NAME}
+                        🏷️ *Version:* ${env.BUILD_TAG}
+                        🎯 *Environment:* ${params.DEPLOYMENT_TARGET}
+                        👤 *Triggered by:* ${env.BUILD_USER ?: 'System'}
+                        🔗 *Build:* ${env.BUILD_URL}
+                    """.stripIndent()
+                )
+            }
+        }
+        
+        failure {
+            script {
+                slackSend(
+                    channel: env.SLACK_CHANNEL,
+                    color: 'danger',
+                    message: """
+                        ❌ *Deployment Failed*
+                        📦 *Application:* ${env.APP_NAME}
+                        🏷️ *Version:* ${env.BUILD_TAG}
+                        🎯 *Environment:* ${params.DEPLOYMENT_TARGET}
+                        ${params.ROLLBACK_ON_FAILURE && env.PREVIOUS_RELEASE != 'none' ? '🔄 *Status:* Rolled back to ' + env.PREVIOUS_RELEASE : ''}
+                        🔗 *Build:* ${env.BUILD_URL}
+                    """.stripIndent()
+                )
+            }
+        }
+        
+        always {
+            archiveArtifacts artifacts: 'target/*.jar,**/reports/**', allowEmptyArchive: true
+            cleanWs cleanWhenFailure: false
+        }
+    }
+}
+    ]]>
