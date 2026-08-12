@@ -1,0 +1,74 @@
+# Migrated from: Jenkinsfile (declarative pipeline)
+# Original source: https://github.com/jenkinsci/pipeline-examples (MIT License)
+name: CI
+
+on:
+  # Jenkins: triggers { cron('@daily') }
+  schedule:
+    - cron: '0 0 * * *'
+  # Jenkins: triggers { pollSCM('H/5 * * * *') } -> native push/pull_request events
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  # Jenkins: parameters { ... }
+  workflow_dispatch:
+    inputs:
+      flag:
+        description: Enable feature flag
+        type: boolean
+        default: true
+      SOME_STRING:
+        description: Test string parameter
+        type: string
+        default: hello
+      ENVIRONMENT:
+        description: Target environment
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+        default: dev
+
+# Jenkins: options { disableConcurrentBuilds() }
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+# Jenkins: parameters. Inputs are empty for cron/push/pull_request runs, so the
+# Jenkins defaults are re-applied with shell parameter expansion below.
+env:
+  FLAG: ${{ inputs.flag }}
+  SOME_STRING: ${{ inputs.SOME_STRING }}
+  ENVIRONMENT: ${{ inputs.ENVIRONMENT }}
+
+jobs:
+  build:
+    name: Build
+    # Jenkins: agent any
+    runs-on: ubuntu-latest
+    # Jenkins: options { timeout(time: 10, unit: 'MINUTES') }
+    timeout-minutes: 10
+    steps:
+      # Jenkins stage 'Setup': checkout scm
+      # (Jenkins used skipDefaultCheckout(true), so the checkout is explicit here.)
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Print parameters
+        run: |
+          echo "Parameter flag: ${FLAG:-true}"
+          echo "Parameter string: ${SOME_STRING:-hello}"
+          echo "Environment: ${ENVIRONMENT:-dev}"
+
+      # Jenkins stage 'Build'
+      - name: Build
+        run: |
+          echo "Building for ${ENVIRONMENT:-dev}"
+          test -f README.md || echo 'No README found'

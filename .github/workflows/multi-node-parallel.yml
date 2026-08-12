@@ -1,0 +1,72 @@
+# Migrated from: multinodeparallel/Jenkinsfile (scripted pipeline)
+# Original source: https://github.com/jenkinsci/pipeline-examples (MIT License)
+#
+# The scripted pipeline built a map of closures (one per node label) and ran them
+# with `parallel builders`. A matrix strategy is the GitHub Actions equivalent:
+# every matrix leg runs concurrently on its own runner.
+name: Multi-node Parallel Build
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build (${{ matrix.label }})
+    # Jenkins: node(label) for labels ['precise', 'trusty', 'windows']
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Ubuntu 12.04 "precise" and 14.04 "trusty" are end-of-life; the closest
+          # supported GitHub-hosted equivalents are used instead.
+          - label: precise
+            runner: ubuntu-22.04
+            unix: true
+          - label: trusty
+            runner: ubuntu-latest
+            unix: true
+          - label: windows
+            runner: windows-latest
+            unix: false
+    steps:
+      # Jenkins stage 'Checkout': checkout scm
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Jenkins stage 'Build': isUnix() ? sh 'make' : bat 'build.bat'
+      - name: Build (unix)
+        if: matrix.unix
+        run: make
+
+      - name: Build (windows)
+        if: ${{ !matrix.unix }}
+        shell: cmd
+        run: build.bat
+
+      # Jenkins stage 'Test': isUnix() ? sh 'make test' : bat 'test.bat'
+      - name: Test (unix)
+        if: matrix.unix
+        run: make test
+
+      - name: Test (windows)
+        if: ${{ !matrix.unix }}
+        shell: cmd
+        run: test.bat
+
+      # Jenkins stage 'Archive': archiveArtifacts artifacts: 'build/**/*', fingerprint: true
+      - name: Archive build output
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: build-${{ matrix.label }}
+          path: build/**/*
+          if-no-files-found: warn
