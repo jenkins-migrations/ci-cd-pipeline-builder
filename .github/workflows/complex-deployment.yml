@@ -1,0 +1,372 @@
+name: Complex deployment
+
+on:
+  workflow_dispatch:
+    inputs:
+      deployment_target:
+        description: Target environment
+        required: true
+        default: dev
+        type: choice
+        options:
+          - dev
+          - staging
+          - production
+      rollback_on_failure:
+        description: Automatically roll back a failed deployment
+        required: true
+        default: true
+        type: boolean
+      custom_tag:
+        description: Custom Docker tag; leave empty to generate one
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-${{ inputs.deployment_target }}
+  cancel-in-progress: false
+
+env:
+  APP_NAME: ${{ vars.APP_NAME || 'microservice-app' }}
+  DOCKER_REGISTRY: ${{ vars.DOCKER_REGISTRY || 'registry.example.com' }}
+  HELM_CHART: ${{ vars.HELM_CHART || 'microservice-chart' }}
+  SLACK_CHANNEL: ${{ vars.SLACK_CHANNEL || '#deployments' }}
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      build_tag: ${{ steps.metadata.outputs.build_tag }}
+      image_tag: ${{ steps.metadata.outputs.image_tag }}
+    steps:
+      # actions/checkout v7.0.1
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: Create deployment metadata
+        id: metadata
+        env:
+          CUSTOM_TAG: ${{ inputs.custom_tag }}
+          DEPLOYMENT_TARGET: ${{ inputs.deployment_target }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          short_sha="$(git rev-parse --short HEAD)"
+          build_tag="${CUSTOM_TAG:-${short_sha}-${GITHUB_RUN_NUMBER}}"
+          if [[ ! "$build_tag" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
+            echo "::error::The Docker tag is invalid."
+            exit 1
+          fi
+          printf 'build_tag=%s\n' "$build_tag" >> "$GITHUB_OUTPUT"
+          printf 'image_tag=%s/%s:%s\n' "$DOCKER_REGISTRY" "$APP_NAME" "$build_tag" >> "$GITHUB_OUTPUT"
+          printf 'Image tag: %s/%s:%s\n' "$DOCKER_REGISTRY" "$APP_NAME" "$build_tag"
+          printf 'Target: %s\n' "$DEPLOYMENT_TARGET"
+
+  unit-tests:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      # actions/checkout v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      # actions/setup-java v6.0.0
+      - uses: actions/setup-java@dd06d9cba3e5552c54d9f8ea23572deb30010f7c
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+      - name: Run unit tests
+        run: mvn --batch-mode clean test
+      # actions/upload-artifact v7.0.1
+      - name: Publish unit-test and coverage reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: unit-test-reports
+          path: |
+            **/surefire-reports/*.xml
+            **/target/site/jacoco/jacoco.xml
+          if-no-files-found: warn
+          retention-days: 5
+
+  security-scan:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      # actions/checkout v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Run dependency scan
+        run: dependency-check --project "$APP_NAME" --scan . --format XML --format HTML
+      # actions/upload-artifact v7.0.1
+      - name: Publish dependency scan
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: dependency-scan-report
+          path: dependency-check-report.*
+          if-no-files-found: error
+          retention-days: 5
+
+  code-quality:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      # actions/checkout v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+      # actions/setup-java v6.0.0
+      - uses: actions/setup-java@dd06d9cba3e5552c54d9f8ea23572deb30010f7c
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+      - name: Analyze with SonarQube and wait for quality gate
+        env:
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: |
+          test -n "$SONAR_HOST_URL"
+          test -n "$SONAR_TOKEN"
+          mvn --batch-mode sonar:sonar \
+            -Dsonar.projectKey="$APP_NAME" \
+            -Dsonar.host.url="$SONAR_HOST_URL" \
+            -Dsonar.token="$SONAR_TOKEN" \
+            -Dsonar.qualitygate.wait=true \
+            -Dsonar.qualitygate.timeout=600
+
+  build-image:
+    needs: [prepare, unit-tests, security-scan, code-quality]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      # actions/checkout v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      # actions/setup-java v6.0.0
+      - uses: actions/setup-java@dd06d9cba3e5552c54d9f8ea23572deb30010f7c
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+      - name: Package application
+        run: mvn --batch-mode package -DskipTests
+      - name: Log in, build, and push image
+        env:
+          IMAGE_TAG: ${{ needs.prepare.outputs.image_tag }}
+          REGISTRY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
+          REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s' "$REGISTRY_PASSWORD" | docker login "$DOCKER_REGISTRY" \
+            --username "$REGISTRY_USERNAME" --password-stdin
+          docker build --tag "$IMAGE_TAG" .
+          docker push "$IMAGE_TAG"
+          docker tag "$IMAGE_TAG" "$DOCKER_REGISTRY/$APP_NAME:latest"
+          docker push "$DOCKER_REGISTRY/$APP_NAME:latest"
+          docker logout "$DOCKER_REGISTRY"
+      - name: Scan image
+        env:
+          IMAGE_TAG: ${{ needs.prepare.outputs.image_tag }}
+        # Preserve Jenkins' advisory-only scan; findings are reported but do not block deployment.
+        run: trivy image --exit-code 0 --severity HIGH,CRITICAL "$IMAGE_TAG"
+      # actions/upload-artifact v7.0.1
+      - name: Archive packages
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: application-packages
+          path: target/*.jar
+          if-no-files-found: warn
+          retention-days: 5
+
+  deploy:
+    needs: [prepare, build-image]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment:
+      name: ${{ inputs.deployment_target }}
+      url: https://${{ inputs.deployment_target }}.example.com
+    outputs:
+      previous_release: ${{ steps.deploy.outputs.previous_release }}
+    steps:
+      - name: Configure Kubernetes access
+        env:
+          KUBE_CONFIG_B64: ${{ secrets.KUBE_CONFIG_B64 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$KUBE_CONFIG_B64"
+          kubeconfig="$RUNNER_TEMP/kubeconfig"
+          printf '%s' "$KUBE_CONFIG_B64" | base64 --decode > "$kubeconfig"
+          chmod 600 "$kubeconfig"
+          printf 'KUBECONFIG=%s\n' "$kubeconfig" >> "$GITHUB_ENV"
+
+      - name: Deploy with rollback
+        id: deploy
+        env:
+          BUILD_TAG: ${{ needs.prepare.outputs.build_tag }}
+          DEPLOYMENT_TARGET: ${{ inputs.deployment_target }}
+          ROLLBACK_ON_FAILURE: ${{ inputs.rollback_on_failure }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          previous_release="$(
+            helm list -n "$DEPLOYMENT_TARGET" -o json |
+              jq -r --arg app "$APP_NAME" '.[] | select(.name == $app) | .app_version' |
+              head -n 1
+          )"
+          previous_release="${previous_release:-none}"
+          printf 'previous_release=%s\n' "$previous_release" >> "$GITHUB_OUTPUT"
+          printf 'Previous release: %s\n' "$previous_release"
+
+          rollback() {
+            status=$?
+            if [[ "$ROLLBACK_ON_FAILURE" == "true" && "$previous_release" != "none" ]]; then
+              echo "Deployment failed; rolling back."
+              helm rollback "$APP_NAME" 0 -n "$DEPLOYMENT_TARGET"
+              kubectl wait --for=condition=available --timeout=300s \
+                "deployment/$APP_NAME" -n "$DEPLOYMENT_TARGET"
+            fi
+            exit "$status"
+          }
+          trap rollback ERR
+
+          helm upgrade --install "$APP_NAME" "$HELM_CHART" \
+            --namespace "$DEPLOYMENT_TARGET" \
+            --set "image.repository=$DOCKER_REGISTRY/$APP_NAME" \
+            --set "image.tag=$BUILD_TAG" \
+            --set "environment=$DEPLOYMENT_TARGET" \
+            --wait --timeout=10m
+          kubectl wait --for=condition=available --timeout=300s \
+            "deployment/$APP_NAME" -n "$DEPLOYMENT_TARGET"
+          trap - ERR
+
+  health-check:
+    needs: deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check service health
+        env:
+          HEALTH_ENDPOINT: https://${{ inputs.deployment_target }}.example.com/health
+        shell: bash
+        run: |
+          for attempt in 1 2 3 4 5; do
+            sleep 10
+            if curl --fail --silent --show-error \
+              --proto '=https' --tlsv1.2 "$HEALTH_ENDPOINT"; then
+              exit 0
+            fi
+            echo "Health-check attempt $attempt failed."
+          done
+          exit 1
+
+  integration-tests:
+    if: inputs.deployment_target != 'production'
+    needs: [deploy, health-check]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      # actions/checkout v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      # actions/setup-java v6.0.0
+      - uses: actions/setup-java@dd06d9cba3e5552c54d9f8ea23572deb30010f7c
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+      - name: Run integration tests
+        env:
+          TEST_ENDPOINT: https://${{ inputs.deployment_target }}.example.com
+          TEST_ENVIRONMENT: ${{ inputs.deployment_target }}
+        run: |
+          mvn --batch-mode failsafe:integration-test \
+            -Dtest.endpoint="$TEST_ENDPOINT" \
+            -Dtest.environment="$TEST_ENVIRONMENT"
+      # actions/upload-artifact v7.0.1
+      - name: Publish integration-test reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: integration-test-reports
+          path: "**/failsafe-reports/*.xml"
+          if-no-files-found: warn
+          retention-days: 5
+
+  smoke-tests:
+    if: ${{ needs.deploy.result == 'success' && needs.health-check.result == 'success' && !failure() && !cancelled() }}
+    needs: [deploy, health-check]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [api, ui, performance]
+    steps:
+      # actions/checkout v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Run smoke-test suite
+        env:
+          BASE_URL: https://${{ inputs.deployment_target }}.example.com
+          DEPLOYMENT_TARGET: ${{ inputs.deployment_target }}
+          SUITE: ${{ matrix.suite }}
+        shell: bash
+        run: |
+          case "$SUITE" in
+            api)
+              newman run postman-collection.json \
+                --environment "$DEPLOYMENT_TARGET.json"
+              ;;
+            ui)
+              cypress run --config "baseUrl=$BASE_URL"
+              ;;
+            performance)
+              artillery run performance-test.yml --target "$BASE_URL"
+              ;;
+          esac
+
+  notify:
+    if: always()
+    needs:
+      - prepare
+      - unit-tests
+      - security-scan
+      - code-quality
+      - build-image
+      - deploy
+      - health-check
+      - integration-tests
+      - smoke-tests
+    runs-on: ubuntu-latest
+    env:
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+    steps:
+      - name: Send Slack result
+        if: env.SLACK_WEBHOOK_URL != ''
+        env:
+          BUILD_TAG: ${{ needs.prepare.outputs.build_tag }}
+          DEPLOYMENT_TARGET: ${{ inputs.deployment_target }}
+          DEPLOY_RESULT: ${{ needs.deploy.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        shell: bash
+        run: |
+          if [[ "$DEPLOY_RESULT" == "success" ]]; then
+            result="Deployment successful"
+          else
+            result="Deployment failed"
+          fi
+          payload="$(jq -n \
+            --arg text "$result: $APP_NAME $BUILD_TAG to $DEPLOYMENT_TARGET ($RUN_URL)" \
+            '{text: $text}')"
+          curl --fail --silent --show-error \
+            --proto '=https' --tlsv1.2 \
+            -H 'Content-Type: application/json' \
+            --data "$payload" "$SLACK_WEBHOOK_URL"

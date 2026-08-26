@@ -1,0 +1,64 @@
+name: Parameters and triggers
+
+on:
+  push:
+  schedule:
+    - cron: "0 0 * * *"
+  workflow_dispatch:
+    inputs:
+      flag:
+        description: Enable feature flag
+        required: true
+        default: true
+        type: boolean
+      some_string:
+        description: Test string parameter
+        required: true
+        default: hello
+        type: string
+      environment:
+        description: Target environment
+        required: true
+        default: dev
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+
+permissions:
+  contents: read
+
+concurrency:
+  group: parameters-and-triggers
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      FLAG_INPUT: ${{ inputs.flag }}
+      STRING_INPUT: ${{ inputs.some_string }}
+      ENVIRONMENT_INPUT: ${{ inputs.environment }}
+    steps:
+      # actions/checkout v7.0.1
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: Display parameters
+        shell: bash
+        run: |
+          flag="${FLAG_INPUT:-true}"
+          some_string="${STRING_INPUT:-hello}"
+          environment="${ENVIRONMENT_INPUT:-dev}"
+          printf 'Parameter flag: %s\n' "$flag"
+          printf 'Parameter string: %s\n' "$some_string"
+          printf 'Environment: %s\n' "$environment"
+
+      - name: Build
+        shell: bash
+        run: |
+          environment="${ENVIRONMENT_INPUT:-dev}"
+          printf 'Building for %s\n' "$environment"
+          test -f README.md || echo 'No README found'
