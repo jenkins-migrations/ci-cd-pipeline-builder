@@ -302,6 +302,7 @@ jobs:
           retention-days: 5
 
   smoke-tests:
+    if: ${{ needs.deploy.result == 'success' && needs.health-check.result == 'success' && !failure() && !cancelled() }}
     needs: [deploy, health-check]
     runs-on: ubuntu-latest
     timeout-minutes: 30

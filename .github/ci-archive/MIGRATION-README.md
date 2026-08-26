@@ -1,6 +1,6 @@
 # Jenkins to GitHub Actions migration report
 
-Issue: #3  
+Issue: #3
 Migration date: 2026-08-26
 
 ## Scope and inventory
@@ -67,7 +67,9 @@ Jenkins from their former locations.
   than after it, avoiding an unapproved production change.
 - Health checks retry five times at ten-second intervals. Integration tests
   skip production. API, UI, and performance smoke tests run as a fail-fast-off
-  matrix.
+  matrix only when both required upstream jobs succeeded; explicit failure and
+  cancellation guards prevent smoke tests from running after an interrupted
+  deployment.
 - Jenkins test/report and artifact publishers map to pinned artifact uploads.
   Slack notification uses a webhook directly, avoiding an additional action.
 - Jenkins workspace cleanup is unnecessary on ephemeral hosted runners.
@@ -141,7 +143,10 @@ images when adding tool installation.
 
 ## Validation
 
-- `actionlint` v1.7.7 passed for all three workflows with no findings.
+- The official standalone `actionlint` v1.7.7 Linux AMD64 binary was verified
+  against its published SHA-256 checksum
+  `023070a287cd8cccd71515fedc843f1985bf96c436b7effaecce67290e7e0757`.
+  It exited with status 0 for all three workflows with zero findings.
 - `git diff --check` passed.
 - Archive byte comparisons confirmed each moved Jenkinsfile is identical to
   its original Git version, and no Jenkinsfile remains outside the archive.
